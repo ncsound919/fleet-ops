@@ -1,0 +1,81 @@
+name: fleet-audit
+
+# Per-repo adoption of the fleet audit. This is the real body for the
+# `fleet-audit` job that `fleet-ci.yml` ships as an advisory echo ("wire
+# RepoRank/Grader/Deep here once reachable from CI"). It runs the PORTABLE part
+# that works on a cloud runner (the local scorers are not reachable from CI, so
+# they stay out of scope here).
+#
+# Copy into a repo at `.github/workflows/fleet-audit.yml` (or let fleet-ops
+# propagate it). Runs on push/PR and on the weekly/nightly schedule.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: '23 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: fleet-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: reject tracked secrets
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -Ei '(\.env$|\.pem$|id_rsa|\.key$|secrets\.json$|cred\.txt$)' | grep -v '\.env\.example' || true)
+          if [ -n "$bad" ]; then echo "TRACKED SECRETS:"; echo "$bad"; exit 1; fi
+          echo "hygiene ok"
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          V=8.21.2
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks detect --source . --redact --exit-code 1 --verbose
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: node
+        if: hashFiles('package.json') != ''
+        run: |
+          set -euo pipefail
+          if [ -f bun.lockb ]; then PM="bun"; elif [ -f pnpm-lock.yaml ]; then PM="pnpm"; elif [ -f yarn.lock ]; then PM="yarn"; else PM="npm"; fi
+          case "$PM" in
+            bun)  npm i -g bun; bun install ;;
+            pnpm) npm i -g pnpm; pnpm install --frozen-lockfile || pnpm install ;;
+            yarn) npm i -g yarn; yarn install --frozen-lockfile || yarn install ;;
+            npm)  npm ci || npm install ;;
+          esac
+          for s in typecheck lint test; do
+            if node -e "process.exit(require('./package.json').scripts?.['$s']?0:1)"; then $PM run $s; else echo "no '$s' script (absent)"; fi
+          done
+      - name: python
+        if: hashFiles('pyproject.toml') != '' || hashFiles('requirements*.txt') != ''
+        run: |
+          set -euo pipefail
+          python -m pip install -q pytest
+          [ -f requirements.txt ] && python -m pip install -q -r requirements.txt || true
+          if find . -name 'test_*.py' -o -name '*_test.py' | grep -q .; then python -m pytest -q; else echo "no python tests (absent)"; fi
+
+  boundary-signal:
+    # Report (do not gate) whether any test touches the real artifact. A green
+    # suite that never spawns a process is the #1 defect class in the lessons.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tests=$(find . -path ./node_modules -prune -o \( -name '*.test.ts' -o -name '*.spec.ts' -o -name 'test_*.py' -o -name '*_test.py' \) -print 2>/dev/null | wc -l)
+          spawns=$(grep -RIlE 'child_process|execa|spawnSync|\bspawn\(|subprocess\.' . 2>/dev/null | wc -l)
+          echo "test_files=$tests spawns_real_process=$spawns" >> "$GITHUB_STEP_SUMMARY"
