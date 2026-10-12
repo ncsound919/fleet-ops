@@ -1,0 +1,175 @@
+name: ecosystem-sweep
+
+# Weekly full checkout sweep (or manual dispatch) across every owned repo:
+# hygiene (tracked secrets), gitleaks, node/python build+test, and the
+# boundary-test signal (does any test spawn a real process/engine?).
+#
+# This is the expensive lane - mind the private-repo Actions minutes
+# (Free = 2000/mo). Cost: repos x ~minutes. Restrict with the `repos` input or
+# move to a self-hosted runner when the always-on box exists.
+#
+# One repo failing never hides the others (fail-fast: false). A repo that errors
+# is reported as ERROR, never silently omitted.
+
+on:
+  schedule:
+    - cron: '0 10 * * 0'
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: Comma-separated repo names to restrict to (blank = all owned, non-fork, non-archived)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ecosystem-sweep
+  cancel-in-progress: false
+
+env:
+  ORG: ncsound919
+  WATCH_TITLE: 'Ecosystem Watch'
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.list.outputs.repos }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - id: list
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_PAT }}
+        run: |
+          set -euo pipefail
+          WANT='${{ github.event.inputs.repos }}'
+          if [ -n "$WANT" ]; then
+            JSON=$(printf '%s' "$WANT" | jq -cR 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length>0))')
+          else
+            JSON=$(gh repo list "$ORG" --limit 300 --json name,isFork,isArchived \
+              --jq '[.[] | select((.isFork|not) and (.isArchived|not)) | .name]')
+          fi
+          echo "repos=$JSON" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq 'length' <<<"$JSON")" >> "$GITHUB_OUTPUT"
+          echo "targets: $(jq -r 'join(", ")' <<<"$JSON")"
+      - name: refuse a vacuous sweep
+        run: |
+          set -euo pipefail
+          n='${{ steps.list.outputs.count }}'
+          if [ "$n" -le 0 ]; then echo "::error::no repos resolved - refusing a vacuous pass"; exit 1; fi
+
+  sweep:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.discover.outputs.repos) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ORG }}/${{ matrix.repo }}
+          token: ${{ secrets.FLEET_PAT }}
+          fetch-depth: 0
+
+      - name: hygiene - reject tracked secrets
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -Ei '(\.env$|\.pem$|id_rsa|\.key$|secrets\.json$|cred\.txt$)' | grep -v '\.env\.example' || true)
+          if [ -n "$bad" ]; then echo "TRACKED SECRETS:"; echo "$bad"; exit 1; fi
+          echo "hygiene ok"
+
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          V=8.21.2
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks detect --source . --redact --exit-code 1 --verbose
+
+      - name: node checks
+        if: hashFiles('package.json') != ''
+        run: |
+          set -euo pipefail
+          if [ -f bun.lockb ]; then PM="bun"; elif [ -f pnpm-lock.yaml ]; then PM="pnpm"; elif [ -f yarn.lock ]; then PM="yarn"; else PM="npm"; fi
+          echo "package manager: $PM"; node -v
+          case "$PM" in
+            bun)  npm i -g bun; bun install ;;
+            pnpm) npm i -g pnpm; pnpm install --frozen-lockfile || pnpm install ;;
+            yarn) npm i -g yarn; yarn install --frozen-lockfile || yarn install ;;
+            npm)  npm ci || npm install ;;
+          esac
+          for s in typecheck lint; do
+            if node -e "process.exit(require('./package.json').scripts?.['$s']?0:1)"; then echo "::group::$s"; $PM run $s; echo "::endgroup::"; else echo "no '$s' script (absent, not passed)"; fi
+          done
+          if node -e "process.exit(require('./package.json').scripts?.test?0:1)"; then echo "::group::test"; $PM test; echo "::endgroup::"; else echo "no 'test' script (absent, not passed)"; fi
+
+      - name: python checks
+        if: hashFiles('pyproject.toml') != '' || hashFiles('requirements*.txt') != ''
+        run: |
+          set -euo pipefail
+          python -m pip install -q pytest
+          if [ -f requirements.txt ]; then python -m pip install -q -r requirements.txt; fi
+          if find . -name 'test_*.py' -o -name '*_test.py' | grep -q .; then python -m pytest -q; else echo "no python tests (absent, not passed)"; fi
+
+      - name: boundary-test signal
+        run: |
+          set -euo pipefail
+          tests=$(find . -path ./node_modules -prune -o \( -name '*.test.ts' -o -name '*.test.tsx' -o -name '*.spec.ts' -o -name 'test_*.py' -o -name '*_test.py' -o -name '*Tests.cpp' \) -print 2>/dev/null | wc -l)
+          spawns=$(grep -RIlE 'child_process|execa|spawnSync|spawn\(|subprocess\.|ProcessStartInfo' --include='*.test.*' --include='test_*.py' --include='*_test.py' . 2>/dev/null | wc -l)
+          jq -n --arg repo "${{ matrix.repo }}" --argjson tests "$tests" --argjson spawns "$spawns" '{repo:$repo, test_files:$tests, spawns_real_process:$spawns}' > watch-report.json
+          echo "test_files=$tests spawns_real_process=$spawns"
+
+      - name: upload sweep report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-${{ matrix.repo }}
+          path: watch-report.json
+          if-no-files-found: warn
+
+  report:
+    needs: [discover, sweep]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: arts
+          merge-multiple: false
+
+      - name: aggregate + publish
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_PAT }}
+        run: |
+          set -euo pipefail
+          out=report.md
+          {
+            echo "## Ecosystem Watch - weekly sweep"
+            echo "targets: ${{ needs.discover.outputs.count }} | run: ${{ github.run_id }}"
+            echo
+            echo "### boundary-test signal (tests that spawn a real process)"
+            echo "| repo | test files | spawns real process |"
+            echo "|---|---|---|"
+          } > "$out"
+          found=0
+          for j in arts/sweep-*/watch-report.json; do
+            [ -f "$j" ] || continue
+            found=$((found+1))
+            echo "| $(jq -r '.repo' "$j") | $(jq -r '.test_files' "$j") | $(jq -r '.spawns_real_process' "$j") |" >> "$out"
+          done
+          echo >> "$out"
+          echo "repos with a boundary report: $found" >> "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upsert tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_PAT }}
+        run: |
+          set -euo pipefail
+          body="$(cat report.md)"
+          num=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$WATCH_TITLE in:title" --json number --jq '.[0].number' 2>/dev/null || echo '')
+          if [ -n "$num" ]; then gh issue comment "$num" -R "$GITHUB_REPOSITORY" --body "$body"; else gh issue create -R "$GITHUB_REPOSITORY" --title "$WATCH_TITLE" --body "$body"; fi
